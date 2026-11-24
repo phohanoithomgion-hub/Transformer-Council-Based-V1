@@ -2078,6 +2078,71 @@ class HyperConnection(nn.Module):
             nn.Linear(hidden_router, 1),
         )
 
+    def _route_and_combine(self, stacked, x_out, attention_mask, seq_idx):
+        n = self.num_streams
+        B, _, T, D = stacked.shape
+        if (isinstance(self.router, nn.Sequential) and len(self.router) == 3
+                and isinstance(self.router[0], nn.Linear) and isinstance(self.router[2], nn.Linear)):
+            r0 = self.router[0]
+            r2 = self.router[2]
+            dt = stacked.dtype
+            W1_s = r0.weight[:, :D].to(dt)
+            W1_x = r0.weight[:, D:].to(dt)
+            b1 = r0.bias.to(dt) if r0.bias is not None else None
+            h_s = F.linear(stacked, W1_s)
+            h_x = F.linear(x_out.to(dt), W1_x, b1).unsqueeze(1)
+            r_hid = self.router[1](h_s + h_x)
+            r_out = F.linear(r_hid, r2.weight.to(dt), r2.bias.to(dt) if r2.bias is not None else None)
+        else:
+            x_out_e = x_out.unsqueeze(1).expand(-1, n, -1, -1)
+            combined = torch.cat([stacked, x_out_e], dim=-1)
+            r_out = self.router(combined)
+
+        r_tok = r_out.squeeze(-1)
+        device = x_out.device
+        valid_tok = torch.ones(B, T, dtype=torch.bool, device=device)
+        if attention_mask is not None:
+            valid_tok = valid_tok & attention_mask[:, :T].bool()
+        if seq_idx is not None:
+            seq_t = seq_idx[:, :T].to(torch.int32)
+            valid_tok = valid_tok & (seq_t >= 0)
+        else:
+            seq_t = None
+
+        v_f = valid_tok.to(dtype=r_tok.dtype)
+        r_masked = r_tok * v_f.unsqueeze(1)
+        r_cs = r_masked.cumsum(dim=2)
+        cnt_cs = v_f.cumsum(dim=1)
+
+        if seq_t is not None:
+            seq_eff = torch.where(valid_tok, seq_t, torch.full_like(seq_t, -1))
+            idx_t = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
+            last_v_idx = torch.where(valid_tok, idx_t, torch.zeros_like(idx_t)).cummax(dim=1).values
+            ff_seq = seq_eff.gather(1, last_v_idx)
+            prev_ff = F.pad(ff_seq[:, :-1], (1, 0), value=-999999)
+            is_seq_start = valid_tok & (ff_seq != prev_ff)
+            start_idx = torch.where(is_seq_start, idx_t, torch.zeros_like(idx_t)).cummax(dim=1).values
+            r_prev = F.pad(r_cs[:, :, :-1], (1, 0), value=0.0)
+            cnt_prev_cs = F.pad(cnt_cs[:, :-1], (1, 0), value=0.0)
+            base_r = r_prev.gather(2, start_idx.unsqueeze(1).expand(-1, n, -1))
+            base_cnt = cnt_prev_cs.gather(1, start_idx)
+            r_sum_seq = r_cs - base_r
+            cnt_seq = cnt_cs - base_cnt
+            scores_tok = r_sum_seq / cnt_seq.clamp(min=1.0).unsqueeze(1)
+        else:
+            scores_tok = r_cs / cnt_cs.clamp(min=1.0).unsqueeze(1)
+
+        topk_vals, topk_idx = scores_tok.topk(self.top_k, dim=1)
+        topk_gates = torch.sigmoid(topk_vals.float()).to(x_out.dtype)
+        tok_stream_mask = torch.zeros(B, n, T, device=x_out.device, dtype=x_out.dtype).scatter(
+            1, topk_idx, topk_gates
+        )
+        tok_stream_mask = tok_stream_mask * valid_tok.to(dtype=x_out.dtype).unsqueeze(1)
+
+        W_out = torch.stack([p.weight for p in self.out_proj], dim=0).to(x_out.dtype)
+        deltas_all = torch.matmul(x_out.unsqueeze(1), W_out.unsqueeze(0).transpose(-1, -2))
+        return stacked + tok_stream_mask.unsqueeze(-1) * deltas_all
+
     def forward(self, streams, layer_fn, attention_mask=None, seq_idx=None, num_seqs=None,
                 router_state=None, return_router_state=False):
         n = self.num_streams
@@ -2089,6 +2154,20 @@ class HyperConnection(nn.Module):
         w_streams = (stacked * w_cast.view(1, n, 1, 1)).permute(1, 0, 2, 3).reshape(n, B * T, D)
         x_in = torch.bmm(w_streams, W_in.transpose(-1, -2)).sum(dim=0).view(B, T, D)
         x_out = layer_fn(x_in)
+
+        if T == 0:
+            new_streams = [stacked[:, i] for i in range(n)]
+            if return_router_state:
+                return new_streams, router_state
+            return new_streams
+
+        if self.training and torch.is_grad_enabled() and router_state is None and not return_router_state:
+            new_stacked = checkpoint(
+                self._route_and_combine, stacked, x_out, attention_mask, seq_idx,
+                use_reentrant=False
+            )
+            return [new_stacked[:, i] for i in range(n)]
+
         if (isinstance(self.router, nn.Sequential) and len(self.router) == 3
                 and isinstance(self.router[0], nn.Linear) and isinstance(self.router[2], nn.Linear)):
             r0 = self.router[0]
@@ -2109,12 +2188,6 @@ class HyperConnection(nn.Module):
         r_tok = r_out.squeeze(-1)
         device = x_out.device
         new_router_state = None
-
-        if T == 0:
-            new_streams = [stacked[:, i] for i in range(n)]
-            if return_router_state:
-                return new_streams, router_state
-            return new_streams
 
         if router_state is not None:
             r_prev_sum, cnt_prev = router_state
@@ -2189,7 +2262,6 @@ class HyperConnection(nn.Module):
         if return_router_state:
             return new_streams, new_router_state
         return new_streams
-
 
 class BlockRouter:
     def __init__(self, top_k_a=4, top_k_b=4):
